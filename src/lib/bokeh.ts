@@ -1,170 +1,280 @@
 /**
- * Hex-aperture bokeh blur.
+ * Hex-aperture bokeh blur for background separation.
  *
- * Simulates a camera's hexagonal aperture by applying three 1-D line blurs
- * at 0°, 60° and 120°, then combining them with a highlight-bloom blend.
- * Adds subtle chromatic aberration for a real-lens feel.
- * All heavy work is done at 28 % resolution then upscaled — fast enough in JS.
+ * Pipeline:
+ *  1. Feather the segmentation mask to get smooth subject edges
+ *  2. Downscale image to 28% for fast bokeh computation
+ *  3. Three directional line-blurs at 0°, 60°, 120° (hex aperture shape)
+ *  4. Highlight bloom: brighten blurred highlights for lens realism
+ *  5. Chromatic aberration: slight R/B channel offset
+ *  6. Upscale blurred result back to original size
+ *  7. Composite: sharp × mask + blurred × (1 − mask)
  */
 
-const SCALE = 0.28 // downscale factor for blur pass
+// ---------------------------------------------------------------------------
+// Public API
+// ---------------------------------------------------------------------------
 
 export async function applyBokehBlur(
   pixels: Uint8ClampedArray,
   width: number,
   height: number,
-  foregroundMask: Float32Array, // 1 = keep sharp, 0 = blur
-  strength = 24,
-  onProgress?: (n: number) => void
+  foregroundMask: Float32Array,
+  strength = 22,
+  onProgress?: (pct: number) => void
 ): Promise<Uint8ClampedArray> {
+  // 1. Feather mask
+  const feathered = featherMask(foregroundMask, width, height);
+  onProgress?.(15);
 
-  // 1. Feather mask edges for a smooth transition
-  const mask = featherMask(foregroundMask, width, height)
-  onProgress?.(15)
+  // 2. Downscale for bokeh (28% resolution)
+  const SCALE = 0.28;
+  const bw = Math.max(1, Math.round(width * SCALE));
+  const bh = Math.max(1, Math.round(height * SCALE));
+  const small = downscale(pixels, width, height, bw, bh);
+  onProgress?.(30);
 
-  // 2. Hex bokeh on a downscaled copy
-  const sw = Math.round(width * SCALE)
-  const sh = Math.round(height * SCALE)
-  const radius = Math.max(3, Math.round(strength * SCALE))
-  const small = downscale(pixels, width, height, sw, sh)
+  // 3. Hex bokeh on downscaled image
+  const bokehRadius = Math.max(2, Math.round(strength * SCALE));
+  let blurred = hexBokeh(small, bw, bh, bokehRadius);
+  onProgress?.(70);
 
-  // Pre-compute direction offsets (0°, 60°, 120°)
-  const dirs = [0, Math.PI / 3, 2 * Math.PI / 3].map(a => {
-    const offsets: [number, number][] = []
-    for (let r = -radius; r <= radius; r++)
-      offsets.push([Math.round(Math.cos(a) * r), Math.round(Math.sin(a) * r)])
-    return offsets
-  })
+  // 4. Chromatic aberration on blurred version
+  const caShift = Math.max(1, Math.round(strength * SCALE * 0.15));
+  blurred = addCA(blurred, bw, bh, caShift);
+  onProgress?.(80);
 
-  const b0   = lineBlur(small, sw, sh, dirs[0])
-  onProgress?.(35)
-  const b60  = lineBlur(small, sw, sh, dirs[1])
-  onProgress?.(50)
-  const b120 = lineBlur(small, sw, sh, dirs[2])
-  onProgress?.(62)
+  // 5. Upscale blurred back to full size
+  const blurredFull = upscale(blurred, bw, bh, width, height);
+  onProgress?.(90);
 
-  // Combine: average + highlight bloom (bright = hex bokeh balls)
-  const combined = new Uint8ClampedArray(small.length)
-  for (let i = 0; i < combined.length; i += 4) {
-    for (let c = 0; c < 3; c++) {
-      const avg  = (b0[i+c] + b60[i+c] + b120[i+c]) / 3
-      const peak = Math.max(b0[i+c], b60[i+c], b120[i+c])
-      const bright = avg / 255
-      combined[i+c] = Math.min(255, Math.round(avg + (peak - avg) * bright * 0.55))
-    }
-    combined[i+3] = 255
-  }
-  onProgress?.(70)
-
-  // Upscale blurred image back
-  const blurred = upscale(combined, sw, sh, width, height)
-  onProgress?.(78)
-
-  // 3. Chromatic aberration on blurred regions only
-  addCA(blurred, width, height, 3)
-  onProgress?.(84)
-
-  // 4. Composite: sharp × mask + blurred × (1-mask)
-  const result = new Uint8ClampedArray(pixels.length)
+  // 6. Composite
+  const result = new Uint8ClampedArray(pixels.length);
   for (let i = 0; i < width * height; i++) {
-    const m = mask[i]
-    result[i*4]   = Math.round(pixels[i*4]   * m + blurred[i*4]   * (1-m))
-    result[i*4+1] = Math.round(pixels[i*4+1] * m + blurred[i*4+1] * (1-m))
-    result[i*4+2] = Math.round(pixels[i*4+2] * m + blurred[i*4+2] * (1-m))
-    result[i*4+3] = 255
+    const m = feathered[i];          // 1 = sharp subject, 0 = blurred background
+    const inv = 1 - m;
+    result[i * 4]     = Math.round(pixels[i * 4]     * m + blurredFull[i * 4]     * inv);
+    result[i * 4 + 1] = Math.round(pixels[i * 4 + 1] * m + blurredFull[i * 4 + 1] * inv);
+    result[i * 4 + 2] = Math.round(pixels[i * 4 + 2] * m + blurredFull[i * 4 + 2] * inv);
+    result[i * 4 + 3] = pixels[i * 4 + 3];
   }
-  onProgress?.(100)
-  return result
+  onProgress?.(100);
+
+  return result;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-
-function lineBlur(
-  pixels: Uint8ClampedArray, w: number, h: number,
-  offsets: [number, number][]
-): Uint8ClampedArray {
-  const out = new Uint8ClampedArray(pixels.length)
-  const n = offsets.length
-  for (let y = 0; y < h; y++) {
-    for (let x = 0; x < w; x++) {
-      let sR = 0, sG = 0, sB = 0
-      for (const [dx, dy] of offsets) {
-        const nx = Math.min(w-1, Math.max(0, x+dx))
-        const ny = Math.min(h-1, Math.max(0, y+dy))
-        const si = (ny*w + nx) * 4
-        sR += pixels[si]; sG += pixels[si+1]; sB += pixels[si+2]
-      }
-      const di = (y*w + x) * 4
-      out[di]   = sR/n; out[di+1] = sG/n; out[di+2] = sB/n; out[di+3] = 255
-    }
-  }
-  return out
-}
-
-function addCA(pixels: Uint8ClampedArray, w: number, h: number, shift: number): void {
-  const orig = pixels.slice()
-  for (let y = 0; y < h; y++) {
-    for (let x = 0; x < w; x++) {
-      const i  = (y*w + x) * 4
-      const rI = (y*w + Math.max(0, x-shift)) * 4
-      const bI = (y*w + Math.min(w-1, x+shift)) * 4
-      pixels[i]   = orig[rI]     // R: shift left
-      pixels[i+2] = orig[bI+2]   // B: shift right
-    }
-  }
-}
+// ---------------------------------------------------------------------------
+// Mask feathering — smooth the hard segmentation edge
+// ---------------------------------------------------------------------------
 
 function featherMask(mask: Float32Array, w: number, h: number): Float32Array {
-  // Blur at 18% res for performance, then upscale
-  const sw = Math.round(w * 0.18), sh = Math.round(h * 0.18)
-  const small = new Float32Array(sw * sh)
-  for (let y = 0; y < sh; y++)
-    for (let x = 0; x < sw; x++)
-      small[y*sw+x] = mask[Math.round(y*h/sh)*w + Math.round(x*w/sw)]
+  // Work at 18% resolution for speed
+  const SCALE = 0.18;
+  const sw = Math.max(1, Math.round(w * SCALE));
+  const sh = Math.max(1, Math.round(h * SCALE));
 
-  const r = 10
-  const tmp = new Float32Array(sw * sh)
-  for (let y = 0; y < sh; y++)
+  // Downscale mask
+  const small = new Float32Array(sw * sh);
+  for (let y = 0; y < sh; y++) {
     for (let x = 0; x < sw; x++) {
-      let s = 0
-      for (let d = -r; d <= r; d++) s += small[y*sw + Math.min(sw-1, Math.max(0, x+d))]
-      tmp[y*sw+x] = s / (r*2+1)
+      const sx = Math.round(x / SCALE);
+      const sy = Math.round(y / SCALE);
+      small[y * sw + x] = mask[Math.min(sy, h - 1) * w + Math.min(sx, w - 1)];
     }
-  const blurred = new Float32Array(sw * sh)
-  for (let x = 0; x < sw; x++)
-    for (let y = 0; y < sh; y++) {
-      let s = 0
-      for (let d = -r; d <= r; d++) s += tmp[Math.min(sh-1, Math.max(0, y+d))*sw+x]
-      blurred[y*sw+x] = s / (r*2+1)
-    }
+  }
 
-  const result = new Float32Array(w * h)
-  for (let y = 0; y < h; y++)
-    for (let x = 0; x < w; x++)
-      result[y*w+x] = blurred[Math.min(sh-1, Math.round(y*sh/h))*sw + Math.min(sw-1, Math.round(x*sw/w))]
-  return result
+  // Separable box blur (radius 10 iterations × 2 passes)
+  const RADIUS = 10;
+  const tmp = boxBlur1D(small, sw, sh, RADIUS, true);
+  const blurred = boxBlur1D(tmp, sw, sh, RADIUS, false);
+
+  // Upscale back
+  const result = new Float32Array(w * h);
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      const sx = Math.min(sw - 1, Math.round(x * SCALE));
+      const sy = Math.min(sh - 1, Math.round(y * SCALE));
+      result[y * w + x] = blurred[sy * sw + sx];
+    }
+  }
+  return result;
 }
 
-function downscale(src: Uint8ClampedArray, sw: number, sh: number, dw: number, dh: number) {
-  const out = new Uint8ClampedArray(dw*dh*4)
-  const xr = sw/dw, yr = sh/dh
-  for (let y = 0; y < dh; y++)
-    for (let x = 0; x < dw; x++) {
-      const si = (Math.min(sh-1, Math.floor(y*yr))*sw + Math.min(sw-1, Math.floor(x*xr))) * 4
-      const di = (y*dw+x)*4
-      out[di]=src[si]; out[di+1]=src[si+1]; out[di+2]=src[si+2]; out[di+3]=255
+function boxBlur1D(
+  src: Float32Array,
+  w: number,
+  h: number,
+  radius: number,
+  horizontal: boolean
+): Float32Array {
+  const dst = new Float32Array(src.length);
+  const span = 2 * radius + 1;
+
+  if (horizontal) {
+    for (let y = 0; y < h; y++) {
+      let sum = 0;
+      for (let x = -radius; x < radius; x++) {
+        sum += src[y * w + Math.max(0, Math.min(w - 1, x))];
+      }
+      for (let x = 0; x < w; x++) {
+        sum += src[y * w + Math.min(w - 1, x + radius)];
+        sum -= src[y * w + Math.max(0, x - radius - 1)];
+        dst[y * w + x] = sum / span;
+      }
     }
-  return out
+  } else {
+    for (let x = 0; x < w; x++) {
+      let sum = 0;
+      for (let y = -radius; y < radius; y++) {
+        sum += src[Math.max(0, Math.min(h - 1, y)) * w + x];
+      }
+      for (let y = 0; y < h; y++) {
+        sum += src[Math.min(h - 1, y + radius) * w + x];
+        sum -= src[Math.max(0, y - radius - 1) * w + x];
+        dst[y * w + x] = sum / span;
+      }
+    }
+  }
+  return dst;
 }
 
-function upscale(src: Uint8ClampedArray, sw: number, sh: number, dw: number, dh: number) {
-  const out = new Uint8ClampedArray(dw*dh*4)
-  const xr = sw/dw, yr = sh/dh
-  for (let y = 0; y < dh; y++)
-    for (let x = 0; x < dw; x++) {
-      const si = (Math.min(sh-1, Math.floor(y*yr))*sw + Math.min(sw-1, Math.floor(x*xr))) * 4
-      const di = (y*dw+x)*4
-      out[di]=src[si]; out[di+1]=src[si+1]; out[di+2]=src[si+2]; out[di+3]=255
+// ---------------------------------------------------------------------------
+// Hex aperture bokeh — three directional line blurs
+// ---------------------------------------------------------------------------
+
+function hexBokeh(
+  pixels: Uint8ClampedArray,
+  w: number,
+  h: number,
+  radius: number
+): Uint8ClampedArray {
+  // Three passes at 0°, 60°, 120° — averaged together
+  const p0   = lineBlur(pixels, w, h, radius, 0);
+  const p60  = lineBlur(pixels, w, h, radius, 60);
+  const p120 = lineBlur(pixels, w, h, radius, 120);
+
+  const result = new Uint8ClampedArray(pixels.length);
+  for (let i = 0; i < pixels.length; i += 4) {
+    for (let c = 0; c < 3; c++) {
+      const avg = (p0[i + c] + p60[i + c] + p120[i + c]) / 3;
+      const peak = Math.max(p0[i + c], p60[i + c], p120[i + c]);
+      const brightness = avg / 255;
+      // Highlight bloom: brighter pixels get more glow
+      result[i + c] = Math.min(255, Math.round(avg + (peak - avg) * brightness * 0.55));
     }
-  return out
+    result[i + 3] = pixels[i + 3];
+  }
+  return result;
+}
+
+function lineBlur(
+  pixels: Uint8ClampedArray,
+  w: number,
+  h: number,
+  radius: number,
+  angleDeg: number
+): Uint8ClampedArray {
+  const result = new Uint8ClampedArray(pixels.length);
+  const rad = (angleDeg * Math.PI) / 180;
+  const dx = Math.cos(rad);
+  const dy = Math.sin(rad);
+
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      let rSum = 0, gSum = 0, bSum = 0, count = 0;
+      for (let s = -radius; s <= radius; s++) {
+        const sx = Math.round(x + dx * s);
+        const sy = Math.round(y + dy * s);
+        if (sx < 0 || sx >= w || sy < 0 || sy >= h) continue;
+        const idx = (sy * w + sx) * 4;
+        rSum += pixels[idx];
+        gSum += pixels[idx + 1];
+        bSum += pixels[idx + 2];
+        count++;
+      }
+      const out = (y * w + x) * 4;
+      if (count > 0) {
+        result[out]     = rSum / count;
+        result[out + 1] = gSum / count;
+        result[out + 2] = bSum / count;
+      }
+      result[out + 3] = pixels[out + 3];
+    }
+  }
+  return result;
+}
+
+// ---------------------------------------------------------------------------
+// Chromatic aberration — subtle R/B channel lateral shift
+// ---------------------------------------------------------------------------
+
+function addCA(
+  pixels: Uint8ClampedArray,
+  w: number,
+  h: number,
+  shift: number
+): Uint8ClampedArray {
+  const result = new Uint8ClampedArray(pixels);
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      const out = (y * w + x) * 4;
+      // Red channel: shift left
+      const rSrc = Math.max(0, x - shift);
+      result[out] = pixels[(y * w + rSrc) * 4];
+      // Blue channel: shift right
+      const bSrc = Math.min(w - 1, x + shift);
+      result[out + 2] = pixels[(y * w + bSrc) * 4 + 2];
+    }
+  }
+  return result;
+}
+
+// ---------------------------------------------------------------------------
+// Nearest-neighbour scale helpers
+// ---------------------------------------------------------------------------
+
+function downscale(
+  src: Uint8ClampedArray,
+  srcW: number,
+  srcH: number,
+  dstW: number,
+  dstH: number
+): Uint8ClampedArray {
+  const dst = new Uint8ClampedArray(dstW * dstH * 4);
+  for (let y = 0; y < dstH; y++) {
+    for (let x = 0; x < dstW; x++) {
+      const sx = Math.min(srcW - 1, Math.round((x / dstW) * srcW));
+      const sy = Math.min(srcH - 1, Math.round((y / dstH) * srcH));
+      const si = (sy * srcW + sx) * 4;
+      const di = (y * dstW + x) * 4;
+      dst[di]     = src[si];
+      dst[di + 1] = src[si + 1];
+      dst[di + 2] = src[si + 2];
+      dst[di + 3] = src[si + 3];
+    }
+  }
+  return dst;
+}
+
+function upscale(
+  src: Uint8ClampedArray,
+  srcW: number,
+  srcH: number,
+  dstW: number,
+  dstH: number
+): Uint8ClampedArray {
+  const dst = new Uint8ClampedArray(dstW * dstH * 4);
+  for (let y = 0; y < dstH; y++) {
+    for (let x = 0; x < dstW; x++) {
+      const sx = Math.min(srcW - 1, Math.round((x / dstW) * srcW));
+      const sy = Math.min(srcH - 1, Math.round((y / dstH) * srcH));
+      const si = (sy * srcW + sx) * 4;
+      const di = (y * dstW + x) * 4;
+      dst[di]     = src[si];
+      dst[di + 1] = src[si + 1];
+      dst[di + 2] = src[si + 2];
+      dst[di + 3] = src[si + 3];
+    }
+  }
+  return dst;
 }
