@@ -10,10 +10,6 @@ import { initSegmenter, segmentImage } from "@/lib/segment";
 import { applyBokehBlur } from "@/lib/bokeh";
 import { applyVignette, applyHalation, applyGrain } from "@/lib/filmEffects";
 
-// ---------------------------------------------------------------------------
-// Types
-// ---------------------------------------------------------------------------
-
 type ProcessingState = "idle" | "processing" | "done" | "error";
 
 interface PhotoResult {
@@ -24,22 +20,17 @@ interface PhotoResult {
   afterBlob: Blob;
 }
 
-// ---------------------------------------------------------------------------
-// Main page
-// ---------------------------------------------------------------------------
-
 export default function Home() {
-  const [appState, setAppState]       = useState<ProcessingState>("idle");
-  const [results, setResults]         = useState<PhotoResult[]>([]);
-  const [progress, setProgress]       = useState(0);
+  const [appState, setAppState]           = useState<ProcessingState>("idle");
+  const [results, setResults]             = useState<PhotoResult[]>([]);
+  const [progress, setProgress]           = useState(0);
   const [progressLabel, setProgressLabel] = useState("");
-  const [errorMsg, setErrorMsg]       = useState("");
-  const [modelReady, setModelReady]   = useState(false);
-  const [activeModal, setActiveModal] = useState<PhotoResult | null>(null);
+  const [errorMsg, setErrorMsg]           = useState("");
+  const [modelReady, setModelReady]       = useState(false);
+  const [activeModal, setActiveModal]     = useState<PhotoResult | null>(null);
 
   const lutRef = useRef<Float32Array | null>(null);
 
-  // Load LUT + warm up segmentation model in parallel on mount
   useEffect(() => {
     fetchDeployedLUT().then((lut) => {
       lutRef.current = lut ?? createClassicChromeLUT(LUT_SIZE);
@@ -52,74 +43,68 @@ export default function Home() {
     return lutRef.current;
   };
 
-  // ── Full film pipeline for a single file ──────────────────────────────────
   const processFile = async (file: File): Promise<PhotoResult> => {
     const beforeUrl = URL.createObjectURL(file);
     const name = file.name.replace(/\.[^.]+$/, "");
 
-    // 1. Load image (EXIF-aware)
+    // Step 1: Load
     setProgressLabel("Loading…");
     setProgress(5);
     const imageData = await fileToImageData(file);
     const pixels = new Uint8ClampedArray(imageData.data);
 
-    // 2. Background segmentation (for bokeh mask)
+    // Step 2: Segment background
     setProgressLabel("Detecting background…");
     setProgress(12);
     const mask = await segmentImage(imageData);
 
-    // 3. Exposure normalisation ONLY — colour is left completely untouched
-    //    so warmth, mood, and natural cast are preserved going into the LUT
+    // Step 3: Exposure only — colours untouched so warmth is preserved
     setProgressLabel("Balancing exposure…");
-    setProgress(22);
+    setProgress(20);
     normalizeExposure(pixels);
 
-    // 4. Hex bokeh blur on background
+    // Step 4: Bokeh (GPU Gaussian blur — no pixelation)
     setProgressLabel("Applying bokeh…");
-    setProgress(32);
+    setProgress(28);
     const bokehPixels = await applyBokehBlur(
       pixels,
       imageData.width,
       imageData.height,
       mask,
-      22,
-      (p) => setProgress(32 + p * 0.28)   // 32 → 60
+      16,                                         // strength 16px — subtle, not aggressive
+      (p) => setProgress(28 + p * 0.25)           // 28 → 53
     );
 
-    // 5. Film LUT — colour grade (Classic Chrome: teal shadows, warm highlights)
+    // Step 5: Film LUT (colour grade)
     setProgressLabel("Applying film look…");
-    setProgress(60);
+    setProgress(55);
     const lutResult = await applyLUT(
       bokehPixels,
       getActiveLUT(),
       LUT_SIZE,
-      (p) => setProgress(60 + p * 0.22)   // 60 → 82
+      (p) => setProgress(55 + p * 0.25)           // 55 → 80
     );
 
-    // 6. Film finishing effects (in-place, fast passes)
+    // Step 6: Film finishing — glow first, then vignette, then grain
     setProgressLabel("Adding film character…");
-    setProgress(84);
+    setProgress(82);
     const finalPixels = new Uint8ClampedArray(lutResult);
-    applyHalation(finalPixels, imageData.width, imageData.height); // warm highlight glow
-    applyVignette(finalPixels, imageData.width, imageData.height);  // dark corners
-    applyGrain(finalPixels, imageData.width, imageData.height);     // visible film grain
+    applyHalation(finalPixels, imageData.width, imageData.height);  // warm glow on highlights
+    applyVignette(finalPixels, imageData.width, imageData.height);  // subtle dark corners
+    applyGrain(finalPixels, imageData.width, imageData.height);     // film grain
 
-    // 7. Encode to JPEG blob
+    // Step 7: Encode
     setProgress(97);
     const blob = await imageDataToBlob(
       new ImageData(finalPixels, imageData.width, imageData.height)
     );
     const afterUrl = URL.createObjectURL(blob);
-
     return { id: crypto.randomUUID(), name, beforeUrl, afterUrl, afterBlob: blob };
   };
 
-  // ── Handle file drop / selection ─────────────────────────────────────────
   const handleFiles = useCallback(
     async (files: File[]) => {
       if (files.length === 0) return;
-
-      // Clean up any previous results
       results.forEach((r) => {
         URL.revokeObjectURL(r.beforeUrl);
         URL.revokeObjectURL(r.afterUrl);
@@ -134,12 +119,9 @@ export default function Home() {
         const newResults: PhotoResult[] = [];
         for (let i = 0; i < files.length; i++) {
           setProgressLabel(
-            files.length > 1
-              ? `Photo ${i + 1} of ${files.length}…`
-              : "Processing…"
+            files.length > 1 ? `Photo ${i + 1} of ${files.length}…` : "Processing…"
           );
-          const r = await processFile(files[i]);
-          newResults.push(r);
+          newResults.push(await processFile(files[i]));
         }
         setResults(newResults);
         setAppState("done");
@@ -152,7 +134,6 @@ export default function Home() {
     [results]
   );
 
-  // ── Download helpers ──────────────────────────────────────────────────────
   const handleDownloadAll = () => {
     results.forEach((r, i) => {
       setTimeout(() => {
@@ -176,11 +157,9 @@ export default function Home() {
     setProgress(0);
   };
 
-  // ── Render ────────────────────────────────────────────────────────────────
   return (
     <main className="min-h-screen flex flex-col items-center px-4 py-12 gap-10">
 
-      {/* Header */}
       <header className="text-center">
         <h1 className="text-2xl font-semibold tracking-wide text-[#e8e8e8]">Fuji Chrome</h1>
         <p className="text-[#666] text-xs mt-1 tracking-widest uppercase">
@@ -194,14 +173,12 @@ export default function Home() {
         </p>
       </header>
 
-      {/* Upload zone */}
       {appState === "idle" && (
         <div className="w-full max-w-lg">
           <PhotoUpload onFiles={handleFiles} disabled={false} />
         </div>
       )}
 
-      {/* Processing indicator */}
       {appState === "processing" && (
         <div className="flex flex-col items-center justify-center gap-4 w-full max-w-lg mx-auto rounded-2xl border-2 border-dashed border-[#2a2a2a] py-16 px-8">
           <div className="w-8 h-8 border-2 border-[#c8a882] border-t-transparent rounded-full animate-spin" />
@@ -215,29 +192,19 @@ export default function Home() {
         </div>
       )}
 
-      {/* Error */}
       {appState === "error" && (
         <div className="w-full max-w-lg rounded-xl bg-red-950/40 border border-red-800/40 px-4 py-3 text-sm text-red-300 flex items-center justify-between">
           <span>{errorMsg}</span>
-          <button
-            onClick={handleReset}
-            className="ml-4 underline text-red-400 hover:text-red-300 shrink-0"
-          >
+          <button onClick={handleReset} className="ml-4 underline text-red-400 hover:text-red-300 shrink-0">
             Try again
           </button>
         </div>
       )}
 
-      {/* Results grid */}
       {appState === "done" && results.length > 0 && (
         <div className="w-full max-w-4xl flex flex-col gap-6">
-
-          {/* Action bar */}
           <div className="flex items-center justify-between">
-            <button
-              onClick={handleReset}
-              className="text-[#666] text-sm hover:text-[#999] transition-colors"
-            >
+            <button onClick={handleReset} className="text-[#666] text-sm hover:text-[#999] transition-colors">
               ← Upload more photos
             </button>
             {results.length > 1 && (
@@ -245,13 +212,11 @@ export default function Home() {
                 onClick={handleDownloadAll}
                 className="flex items-center gap-2 bg-[#c8a882] hover:bg-[#d4b896] text-black font-medium text-sm px-5 py-2.5 rounded-lg transition-colors"
               >
-                <DownloadIcon />
-                Download all ({results.length})
+                <DownloadIcon /> Download all ({results.length})
               </button>
             )}
           </div>
 
-          {/* Photo cards */}
           <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
             {results.map((r) => (
               <div
@@ -261,11 +226,7 @@ export default function Home() {
               >
                 <div className="relative aspect-square overflow-hidden">
                   {/* eslint-disable-next-line @next/next/no-img-element */}
-                  <img
-                    src={r.afterUrl}
-                    alt={r.name}
-                    className="w-full h-full object-cover"
-                  />
+                  <img src={r.afterUrl} alt={r.name} className="w-full h-full object-cover" />
                   <div className="absolute inset-0 bg-black/0 group-hover:bg-black/20 transition-colors flex items-center justify-center">
                     <span className="text-white text-xs font-medium opacity-0 group-hover:opacity-100 transition-opacity bg-black/60 px-3 py-1 rounded-full">
                       Compare
@@ -294,25 +255,15 @@ export default function Home() {
         </div>
       )}
 
-      {/* Modal — before/after comparison */}
       {activeModal && (
         <div
           className="fixed inset-0 z-50 flex items-center justify-center bg-black/85 p-4"
           onClick={() => setActiveModal(null)}
         >
-          <div
-            className="relative w-full max-w-3xl"
-            onClick={(e) => e.stopPropagation()}
-          >
-            <BeforeAfterSlider
-              beforeUrl={activeModal.beforeUrl}
-              afterUrl={activeModal.afterUrl}
-            />
+          <div className="relative w-full max-w-3xl" onClick={(e) => e.stopPropagation()}>
+            <BeforeAfterSlider beforeUrl={activeModal.beforeUrl} afterUrl={activeModal.afterUrl} />
             <div className="flex items-center justify-between mt-3">
-              <button
-                onClick={() => setActiveModal(null)}
-                className="text-[#666] text-sm hover:text-[#999] transition-colors"
-              >
+              <button onClick={() => setActiveModal(null)} className="text-[#666] text-sm hover:text-[#999] transition-colors">
                 ✕ Close
               </button>
               <button
@@ -324,8 +275,7 @@ export default function Home() {
                 }}
                 className="flex items-center gap-2 bg-[#c8a882] hover:bg-[#d4b896] text-black font-medium text-sm px-5 py-2.5 rounded-lg transition-colors"
               >
-                <DownloadIcon />
-                Download
+                <DownloadIcon /> Download
               </button>
             </div>
           </div>
@@ -338,10 +288,6 @@ export default function Home() {
     </main>
   );
 }
-
-// ---------------------------------------------------------------------------
-// Icon
-// ---------------------------------------------------------------------------
 
 function DownloadIcon() {
   return (
