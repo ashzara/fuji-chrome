@@ -8,7 +8,15 @@ function idx(r: number, g: number, b: number, size: number): number {
 }
 
 // ---------------------------------------------------------------------------
-// Built-in Classic Chrome approximation
+// Classic Chrome LUT — tuned to match reference film photography
+//
+// Reference characteristics (from example photos):
+//  • Lifted blacks     — shadows never reach pure black (~0.05 floor)
+//  • Strong teal shadows — blue pushed hard in dark areas, red pulled
+//  • Warm golden highlights — skin and bright areas glow warm/orange
+//  • Vivid colours     — reds stay red, greens stay rich (low desaturation ~8%)
+//  • High contrast     — strong S-curve separates shadows from highlights
+//  • Film roll-off     — whites compress softly before clipping
 // ---------------------------------------------------------------------------
 
 export function createClassicChromeLUT(size = LUT_SIZE): Float32Array {
@@ -21,22 +29,42 @@ export function createClassicChromeLUT(size = LUT_SIZE): Float32Array {
         let gv = g / (size - 1);
         let bv = b / (size - 1);
 
-        // 1. Tone curve: lift blacks to 0.038, compress whites to 0.94
-        rv = 0.038 + rv * (0.94 - 0.038);
-        gv = 0.038 + gv * (0.94 - 0.038);
-        bv = 0.038 + bv * (0.94 - 0.038);
-
-        // 2. Color matrix: orange/red warmth, olive greens, muted blues
-        const ro = 0.96 * rv + 0.04 * gv + 0.00 * bv;
-        const go = 0.01 * rv + 0.91 * gv + 0.08 * bv;
-        const bo = 0.01 * rv + 0.04 * gv + 0.95 * bv;
-        rv = ro; gv = go; bv = bo;
-
-        // 3. Desaturate ~22%
+        // Input luminance — drives shadow/highlight effects
         const lum = 0.2126 * rv + 0.7152 * gv + 0.0722 * bv;
-        rv = lum * 0.22 + rv * 0.78;
-        gv = lum * 0.22 + gv * 0.78;
-        bv = lum * 0.22 + bv * 0.78;
+
+        // ── 1. Tone curves: lift blacks, compress whites ─────────────────────
+        rv = curveCh(rv, 0.050, 0.950);   // Red
+        gv = curveCh(gv, 0.048, 0.938);   // Green — slightly more compressed
+        bv = curveCh(bv, 0.058, 0.942);   // Blue  — more black lift (teal blacks)
+
+        // ── 2. Shadow teal (strong — matches reference photos) ───────────────
+        // Drives teal cast in areas below ~lum 0.30
+        const shadow = Math.max(0, 1 - lum / 0.30);
+        rv -= shadow * 0.038;   // pull red out of shadows
+        gv += shadow * 0.008;   // slight green
+        bv += shadow * 0.078;   // strong blue push → teal
+
+        // ── 3. Warm golden highlights ────────────────────────────────────────
+        // Kicks in above lum 0.65, peaks at pure white
+        const hi = Math.max(0, (lum - 0.65) / 0.35);
+        const hiSq = hi * hi;            // quadratic — subtle until very bright
+        rv += hiSq * 0.038;   // push red → warm
+        gv += hiSq * 0.010;   // slight green boost (golden, not orange-red)
+        bv -= hiSq * 0.025;   // pull blue → warm
+
+        // ── 4. S-curve contrast ──────────────────────────────────────────────
+        // Deeper shadows, punchier midtones — the "film pop" look
+        rv = scurve(rv, 0.10);
+        gv = scurve(gv, 0.10);
+        bv = scurve(bv, 0.10);
+
+        // ── 5. Minimal desaturation (~8%) ────────────────────────────────────
+        // Reference photos keep vivid reds and greens — don't over-mute
+        const lum2 = 0.2126 * rv + 0.7152 * gv + 0.0722 * bv;
+        const SAT = 0.92;
+        rv = lum2 + (rv - lum2) * SAT;
+        gv = lum2 + (gv - lum2) * SAT;
+        bv = lum2 + (bv - lum2) * SAT;
 
         const base = idx(r, g, b, size);
         lut[base]     = Math.max(0, Math.min(1, rv));
@@ -47,6 +75,23 @@ export function createClassicChromeLUT(size = LUT_SIZE): Float32Array {
   }
 
   return lut;
+}
+
+/**
+ * Per-channel tone curve: maps [0,1] → [blackLift, whitePoint].
+ * Blacks are lifted (no pure black), whites are compressed (no blown-out white).
+ */
+function curveCh(x: number, blackLift: number, whitePoint: number): number {
+  return blackLift + x * (whitePoint - blackLift);
+}
+
+/**
+ * S-curve for contrast — darkens the dark side, brightens the bright side.
+ * strength 0.10 gives the punchy film-like contrast in the reference photos.
+ */
+function scurve(x: number, strength: number): number {
+  // sin-based: no effect at endpoints (0 and 1), max at 0.25 and 0.75
+  return x + strength * Math.sin(Math.PI * x) * (x - 0.5);
 }
 
 // ---------------------------------------------------------------------------
@@ -105,7 +150,6 @@ export async function applyLUT(
     }
 
     onProgress?.((end / n) * 100);
-    // Yield to UI thread between chunks
     await new Promise<void>((r) => setTimeout(r, 0));
   }
 
