@@ -1,22 +1,18 @@
 export const LUT_SIZE = 33;
 
-// LUT memory layout: flat Float32Array
-// index = (r * SIZE * SIZE + g * SIZE + b) * 3 + channel
-
 function idx(r: number, g: number, b: number, size: number): number {
   return (r * size * size + g * size + b) * 3;
 }
 
 // ---------------------------------------------------------------------------
-// Classic Chrome LUT — tuned to match reference film photography
+// Classic Chrome LUT
 //
-// Reference characteristics (from example photos):
-//  • Lifted blacks     — shadows never reach pure black (~0.05 floor)
+// Tuned to match reference film photos:
+//  • Lifted blacks       — ~0.05 floor, nothing goes fully black
 //  • Strong teal shadows — blue pushed hard in dark areas, red pulled
 //  • Warm golden highlights — skin and bright areas glow warm/orange
-//  • Vivid colours     — reds stay red, greens stay rich (low desaturation ~8%)
-//  • High contrast     — strong S-curve separates shadows from highlights
-//  • Film roll-off     — whites compress softly before clipping
+//  • Rich colour         — only ~8% desaturation (reds stay red, greens stay green)
+//  • Gentle contrast     — S-curve reduced so midtones stay bright (not crushed)
 // ---------------------------------------------------------------------------
 
 export function createClassicChromeLUT(size = LUT_SIZE): Float32Array {
@@ -29,39 +25,37 @@ export function createClassicChromeLUT(size = LUT_SIZE): Float32Array {
         let gv = g / (size - 1);
         let bv = b / (size - 1);
 
-        // Input luminance — drives shadow/highlight effects
+        // Input luminance — drives shadow/highlight colour effects
         const lum = 0.2126 * rv + 0.7152 * gv + 0.0722 * bv;
 
-        // ── 1. Tone curves: lift blacks, compress whites ─────────────────────
-        rv = curveCh(rv, 0.050, 0.950);   // Red
-        gv = curveCh(gv, 0.048, 0.938);   // Green — slightly more compressed
-        bv = curveCh(bv, 0.058, 0.942);   // Blue  — more black lift (teal blacks)
+        // ── 1. Tone curves: lift blacks, soft white roll-off ─────────────────
+        rv = curveCh(rv, 0.050, 0.952);
+        gv = curveCh(gv, 0.048, 0.940);
+        bv = curveCh(bv, 0.058, 0.944);   // blue gets extra shadow lift
 
-        // ── 2. Shadow teal (strong — matches reference photos) ───────────────
-        // Drives teal cast in areas below ~lum 0.30
+        // ── 2. Shadow teal ───────────────────────────────────────────────────
+        // Strong in very dark areas (lum < 0.30), fades to zero by lum 0.30
         const shadow = Math.max(0, 1 - lum / 0.30);
-        rv -= shadow * 0.038;   // pull red out of shadows
-        gv += shadow * 0.008;   // slight green
-        bv += shadow * 0.078;   // strong blue push → teal
+        rv -= shadow * 0.035;
+        gv += shadow * 0.006;
+        bv += shadow * 0.072;   // strong blue → teal cast
 
         // ── 3. Warm golden highlights ────────────────────────────────────────
-        // Kicks in above lum 0.65, peaks at pure white
-        const hi = Math.max(0, (lum - 0.65) / 0.35);
-        const hiSq = hi * hi;            // quadratic — subtle until very bright
-        rv += hiSq * 0.038;   // push red → warm
-        gv += hiSq * 0.010;   // slight green boost (golden, not orange-red)
-        bv -= hiSq * 0.025;   // pull blue → warm
+        // Kicks in at lum 0.62, quadratic so it's subtle until very bright
+        const hi  = Math.max(0, (lum - 0.62) / 0.38);
+        const hiQ = hi * hi;
+        rv += hiQ * 0.040;   // warm red
+        gv += hiQ * 0.012;   // slight green (golden, not harsh orange)
+        bv -= hiQ * 0.028;   // pull blue → warm
 
-        // ── 4. S-curve contrast ──────────────────────────────────────────────
-        // Deeper shadows, punchier midtones — the "film pop" look
-        rv = scurve(rv, 0.10);
-        gv = scurve(gv, 0.10);
-        bv = scurve(bv, 0.10);
+        // ── 4. Gentle S-curve (reduced from 0.10 to 0.05 — less crushing) ───
+        rv = scurve(rv, 0.05);
+        gv = scurve(gv, 0.05);
+        bv = scurve(bv, 0.05);
 
-        // ── 5. Minimal desaturation (~8%) ────────────────────────────────────
-        // Reference photos keep vivid reds and greens — don't over-mute
+        // ── 5. Minimal desaturation (~8%) — keep colours vivid ───────────────
         const lum2 = 0.2126 * rv + 0.7152 * gv + 0.0722 * bv;
-        const SAT = 0.92;
+        const SAT  = 0.92;
         rv = lum2 + (rv - lum2) * SAT;
         gv = lum2 + (gv - lum2) * SAT;
         bv = lum2 + (bv - lum2) * SAT;
@@ -77,20 +71,11 @@ export function createClassicChromeLUT(size = LUT_SIZE): Float32Array {
   return lut;
 }
 
-/**
- * Per-channel tone curve: maps [0,1] → [blackLift, whitePoint].
- * Blacks are lifted (no pure black), whites are compressed (no blown-out white).
- */
 function curveCh(x: number, blackLift: number, whitePoint: number): number {
   return blackLift + x * (whitePoint - blackLift);
 }
 
-/**
- * S-curve for contrast — darkens the dark side, brightens the bright side.
- * strength 0.10 gives the punchy film-like contrast in the reference photos.
- */
 function scurve(x: number, strength: number): number {
-  // sin-based: no effect at endpoints (0 and 1), max at 0.25 and 0.75
   return x + strength * Math.sin(Math.PI * x) * (x - 0.5);
 }
 
@@ -105,9 +90,9 @@ export async function applyLUT(
   onProgress?: (pct: number) => void
 ): Promise<Uint8ClampedArray> {
   const result = new Uint8ClampedArray(input.length);
-  const n = input.length / 4;
-  const max = size - 1;
-  const CHUNK = 150_000;
+  const n      = input.length / 4;
+  const max    = size - 1;
+  const CHUNK  = 150_000;
 
   for (let start = 0; start < n; start += CHUNK) {
     const end = Math.min(start + CHUNK, n);
@@ -121,7 +106,7 @@ export async function applyLUT(
       const g0 = gf | 0, g1 = Math.min(g0 + 1, max);
       const b0 = bf | 0, b1 = Math.min(b0 + 1, max);
       const fr = rf - r0, fg = gf - g0, fb = bf - b0;
-      const nr = 1 - fr, ng = 1 - fg, nb = 1 - fb;
+      const nr = 1 - fr,  ng = 1 - fg,  nb = 1 - fb;
 
       const i000 = idx(r0, g0, b0, size);
       const i001 = idx(r0, g0, b1, size);
