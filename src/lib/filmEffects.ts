@@ -2,37 +2,73 @@
  * Film-finishing effects applied after the LUT.
  * All functions mutate the pixel array in place.
  *
- * Tuned to match the reference "film photography" aesthetic:
- *  applyVignette  — noticeable dark-corner falloff (pulls eye to subject)
- *  applyHalation  — warm orange glow on bright highlights (film light bleed)
- *  applyGrain     — visible film grain, strongest in midtones
+ *  applyHalation  — warm golden glow on bright highlights (film light bleed)
+ *  applyVignette  — subtle dark-edge falloff (cinematic framing, not crushing)
+ *  applyGrain     — luminance-weighted film grain
  */
 
 // ---------------------------------------------------------------------------
-// Vignette
+// Halation (warm highlight glow) — applied BEFORE vignette so bright areas
+// glow warmly even near edges
 // ---------------------------------------------------------------------------
 
 /**
- * Darkens edges with a smooth elliptical falloff.
- * strength 0.55 matches the noticeable vignette in the reference photos.
+ * Adds a warm orange-gold glow to bright highlights.
+ * This is the "flashlight / glowing" effect from film emulsion light bleed.
+ * strength 0.55 makes it clearly visible like the reference photos.
  */
-export function applyVignette(
+export function applyHalation(
   pixels: Uint8ClampedArray,
   width: number,
   height: number,
   strength = 0.55
 ): void {
+  for (let i = 0; i < width * height; i++) {
+    const r   = pixels[i * 4]     / 255;
+    const g   = pixels[i * 4 + 1] / 255;
+    const b   = pixels[i * 4 + 2] / 255;
+    const lum = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+
+    // Glow starts at 60% brightness so it's visible in more of the image
+    if (lum <= 0.60) continue;
+
+    // Quadratic ramp: 0 at lum=0.60, 1 at lum=1.0
+    const t    = ((lum - 0.60) / 0.40) ** 2;
+    const glow = t * strength;
+
+    // Warm golden-orange tint — matches the "glowing skin" look in references
+    pixels[i * 4]     = Math.min(255, Math.round(pixels[i * 4]     + glow * 38));  // red
+    pixels[i * 4 + 1] = Math.min(255, Math.round(pixels[i * 4 + 1] + glow * 18));  // green (golden)
+    pixels[i * 4 + 2] = Math.min(255, Math.max(0,
+                        Math.round(pixels[i * 4 + 2] - glow * 14)));              // pull blue
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Vignette — subtle, does NOT crush the image
+// ---------------------------------------------------------------------------
+
+/**
+ * Gently darkens edges.
+ * strength 0.38 gives a soft cinematic frame without making the image dark.
+ * (Previous 0.55 was too heavy — it was the main cause of "too dark" result.)
+ */
+export function applyVignette(
+  pixels: Uint8ClampedArray,
+  width: number,
+  height: number,
+  strength = 0.38
+): void {
   for (let y = 0; y < height; y++) {
     for (let x = 0; x < width; x++) {
-      // Normalised distance from centre (-1 to 1 in each axis)
       const nx = (x / width  - 0.5) * 2;
       const ny = (y / height - 0.5) * 2;
 
-      // Elliptical falloff — slightly wider than tall (portrait-friendly)
-      const dist = Math.sqrt(nx * nx * 0.82 + ny * ny * 1.18);
+      // Slightly wider ellipse — portrait-friendly
+      const dist = Math.sqrt(nx * nx * 0.80 + ny * ny * 1.20);
 
-      // Smooth cubic: gentle in the middle, dark at corners
-      const t = Math.min(1, dist * 0.88);
+      // Smooth cubic — only kicks in near edges, very gentle in the centre
+      const t   = Math.min(1, dist * 0.90);
       const vig = 1 - strength * t * t * (3 - 2 * t);
 
       const i = (y * width + x) * 4;
@@ -44,71 +80,34 @@ export function applyVignette(
 }
 
 // ---------------------------------------------------------------------------
-// Halation (warm highlight bloom)
-// ---------------------------------------------------------------------------
-
-/**
- * Adds a warm orange-red glow to the brightest highlights.
- * Mimics light bleeding through film emulsion layers.
- * Reference photos show clear warm glow on skin and bright areas.
- */
-export function applyHalation(
-  pixels: Uint8ClampedArray,
-  width: number,
-  height: number,
-  strength = 0.35
-): void {
-  for (let i = 0; i < width * height; i++) {
-    const r = pixels[i * 4]     / 255;
-    const g = pixels[i * 4 + 1] / 255;
-    const b = pixels[i * 4 + 2] / 255;
-    const lum = 0.2126 * r + 0.7152 * g + 0.0722 * b;
-
-    // Only affects pixels above 68% brightness
-    if (lum <= 0.68) continue;
-
-    // Quadratic ramp: smooth onset at 0.68, full at 1.0
-    const t = ((lum - 0.68) / 0.32) ** 2;
-    const glow = t * strength;
-
-    // Warm orange-red tint (matches reference photo highlight warmth)
-    pixels[i * 4]     = Math.min(255, Math.round(pixels[i * 4]     + glow * 32));
-    pixels[i * 4 + 1] = Math.min(255, Math.round(pixels[i * 4 + 1] + glow * 12));
-    pixels[i * 4 + 2] = Math.min(255, Math.max(0, Math.round(pixels[i * 4 + 2] - glow * 12)));
-  }
-}
-
-// ---------------------------------------------------------------------------
 // Film grain
 // ---------------------------------------------------------------------------
 
 /**
- * Adds luminance-weighted noise that mimics real film grain.
- * amount 15 gives clearly visible grain matching the reference photos.
- * Grain is strongest in midtones, tapering off in deep shadows and highlights.
+ * Luminance-weighted grain. Strongest in midtones, tapers in shadows/highlights.
+ * amount 13 is clearly visible but not overwhelming.
  */
 export function applyGrain(
   pixels: Uint8ClampedArray,
   width: number,
   height: number,
-  amount = 15
+  amount = 13
 ): void {
   for (let i = 0; i < width * height; i++) {
-    const r = pixels[i * 4]     / 255;
-    const g = pixels[i * 4 + 1] / 255;
-    const b = pixels[i * 4 + 2] / 255;
+    const r   = pixels[i * 4]     / 255;
+    const g   = pixels[i * 4 + 1] / 255;
+    const b   = pixels[i * 4 + 2] / 255;
     const lum = 0.2126 * r + 0.7152 * g + 0.0722 * b;
 
-    // Grain envelope peaks at lum ~0.38 — mimics real film grain distribution
-    const envelope = amount * (4.8 * lum * Math.pow(1 - lum, 1.3));
+    // Grain peaks around lum 0.38 — classic film grain behaviour
+    const env = amount * (4.8 * lum * Math.pow(1 - lum, 1.3));
 
-    // Per-channel variation for slight colour grain (more film-authentic)
-    const noiseR = (Math.random() - 0.5) * envelope;
-    const noiseG = (Math.random() - 0.5) * envelope * 0.90;
-    const noiseB = (Math.random() - 0.5) * envelope * 0.95;
+    const nR = (Math.random() - 0.5) * env;
+    const nG = (Math.random() - 0.5) * env * 0.90;
+    const nB = (Math.random() - 0.5) * env * 0.95;
 
-    pixels[i * 4]     = Math.min(255, Math.max(0, Math.round(pixels[i * 4]     + noiseR)));
-    pixels[i * 4 + 1] = Math.min(255, Math.max(0, Math.round(pixels[i * 4 + 1] + noiseG)));
-    pixels[i * 4 + 2] = Math.min(255, Math.max(0, Math.round(pixels[i * 4 + 2] + noiseB)));
+    pixels[i * 4]     = Math.min(255, Math.max(0, Math.round(pixels[i * 4]     + nR)));
+    pixels[i * 4 + 1] = Math.min(255, Math.max(0, Math.round(pixels[i * 4 + 1] + nG)));
+    pixels[i * 4 + 2] = Math.min(255, Math.max(0, Math.round(pixels[i * 4 + 2] + nB)));
   }
 }
