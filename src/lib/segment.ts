@@ -2,8 +2,8 @@
  * Background segmentation using MediaPipe Selfie Segmentation.
  * Loaded from CDN at runtime — no npm package needed.
  *
- * Returns a Float32Array mask where 1 = foreground (keep sharp) and 0 = background (blur).
- * Falls back to a soft-ellipse centre mask if MediaPipe fails to load.
+ * Returns a Float32Array mask where 1 = foreground (subject) and 0 = background.
+ * Falls back to a wide soft-ellipse centre mask if MediaPipe fails to load.
  */
 
 declare global {
@@ -26,17 +26,15 @@ export async function initSegmenter(): Promise<void> {
       await loadScript(
         "https://cdn.jsdelivr.net/npm/@mediapipe/selfie_segmentation@0.1/selfie_segmentation.js"
       );
-
       const instance = new window.SelfieSegmentation({
         locateFile: (file: string) =>
           `https://cdn.jsdelivr.net/npm/@mediapipe/selfie_segmentation@0.1/${file}`,
       });
-
       instance.setOptions({ modelSelection: 1 });
       await instance.initialize();
       segmenter = instance;
     } catch (err) {
-      console.warn("MediaPipe failed to load, will use fallback mask.", err);
+      console.warn("MediaPipe failed to load, using fallback mask.", err);
       segmenter = null;
     }
   })();
@@ -49,8 +47,7 @@ export async function segmentImage(imageData: ImageData): Promise<Float32Array> 
 
   const { width, height } = imageData;
   const canvas = new OffscreenCanvas(width, height);
-  const ctx = canvas.getContext("2d")!;
-  ctx.putImageData(imageData, 0, 0);
+  canvas.getContext("2d")!.putImageData(imageData, 0, 0);
 
   return new Promise((resolve) => {
     segmenter.onResults((results: { segmentationMask: ImageBitmap }) => {
@@ -62,7 +59,6 @@ export async function segmentImage(imageData: ImageData): Promise<Float32Array> 
 
         const mask = new Float32Array(width * height);
         for (let i = 0; i < mask.length; i++) {
-          // MediaPipe segmentation mask: red channel holds the confidence
           mask[i] = maskData[i * 4] / 255;
         }
         resolve(mask);
@@ -71,7 +67,6 @@ export async function segmentImage(imageData: ImageData): Promise<Float32Array> 
       }
     });
 
-    // Convert OffscreenCanvas to HTMLCanvasElement-compatible object
     const imgBitmap = canvas.transferToImageBitmap();
     segmenter.send({ image: imgBitmap }).catch(() => {
       resolve(centerMask(width, height));
@@ -80,43 +75,42 @@ export async function segmentImage(imageData: ImageData): Promise<Float32Array> 
 }
 
 // ---------------------------------------------------------------------------
-// Fallback: smooth ellipse centred slightly above mid-frame (typical portrait)
+// Fallback: wide soft ellipse — covers most portrait/selfie compositions
+// Subject is assumed to be roughly centred, slightly above the midpoint.
+// The very gradual falloff means the transition looks natural even without
+// a precise segmentation mask.
 // ---------------------------------------------------------------------------
 
 function centerMask(w: number, h: number): Float32Array {
   const mask = new Float32Array(w * h);
-  const cx = 0.5;
-  const cy = 0.42;
-  const rx = 0.38;
-  const ry = 0.48;
+  const cx = 0.50;   // horizontal centre
+  const cy = 0.42;   // slightly above vertical centre (typical portrait)
+  const rx = 0.48;   // wide — covers most of the horizontal frame
+  const ry = 0.56;   // tall
 
   for (let y = 0; y < h; y++) {
     for (let x = 0; x < w; x++) {
       const nx = (x / w - cx) / rx;
       const ny = (y / h - cy) / ry;
       const d = Math.sqrt(nx * nx + ny * ny);
-      // Smooth falloff between 0.7 and 1.0 of the ellipse radius
-      mask[y * w + x] = 1 - Math.max(0, Math.min(1, (d - 0.7) / 0.3));
+      // Gradual falloff: full opacity inside 0.55, fades to 0 by 1.05
+      mask[y * w + x] = 1 - Math.max(0, Math.min(1, (d - 0.55) / 0.50));
     }
   }
-
   return mask;
 }
 
 // ---------------------------------------------------------------------------
-// Script loader helper
+// Script loader
 // ---------------------------------------------------------------------------
 
 function loadScript(src: string): Promise<void> {
   return new Promise((resolve, reject) => {
-    if (document.querySelector(`script[src="${src}"]`)) {
-      resolve();
-      return;
-    }
+    if (document.querySelector(`script[src="${src}"]`)) { resolve(); return; }
     const el = document.createElement("script");
     el.src = src;
     el.crossOrigin = "anonymous";
-    el.onload = () => resolve();
+    el.onload  = () => resolve();
     el.onerror = () => reject(new Error(`Failed to load ${src}`));
     document.head.appendChild(el);
   });

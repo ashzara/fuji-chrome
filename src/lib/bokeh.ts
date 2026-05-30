@@ -1,73 +1,91 @@
 /**
- * Background bokeh blur using the browser's built-in canvas filter.
+ * Subject/background separation — creates the "flash photography" look.
  *
- * Previous approach (directional line blurs at 28% resolution) caused:
- *  - Pixelation from aggressive downscaling + nearest-neighbour upscale
- *  - Directional smear artefacts from line blurs
+ * Effect:
+ *  • Background: darkened to ~35% brightness + subtle blur (recedes into dark)
+ *  • Subject:    brightness-boosted + slight warm flash tint (pops forward)
  *
- * This version uses OffscreenCanvas `filter: blur(Xpx)` which is:
- *  - Hardware-accelerated (GPU Gaussian blur)
- *  - Smooth, no pixelation
- *  - Full resolution — no downscale/upscale step
+ * This is what makes a photo look like it was taken with a point-and-shoot
+ * flash camera or a disposable film camera in low/mixed light.
  */
 
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
 
-export async function applyBokehBlur(
+export async function applySubjectFlash(
   pixels: Uint8ClampedArray,
   width: number,
   height: number,
   foregroundMask: Float32Array,
-  strength = 16,
+  options: {
+    blurStrength?: number;   // background blur radius in px (default 10)
+    bgDarken?: number;       // background multiplier  — 0.35 = 65% darker (default)
+    subjectBoost?: number;   // subject brightness multiplier (default 1.10)
+  } = {},
   onProgress?: (pct: number) => void
 ): Promise<Uint8ClampedArray> {
+  const {
+    blurStrength  = 10,
+    bgDarken      = 0.35,
+    subjectBoost  = 1.10,
+  } = options;
 
-  // 1. Feather mask edges for smooth subject/background transition
-  const feathered = featherMask(foregroundMask, width, height);
+  // 1. Feather mask for smooth subject/background edge
+  const mask = featherMask(foregroundMask, width, height);
   onProgress?.(20);
 
-  // 2. GPU Gaussian blur via canvas filter — clean, no pixelation
+  // 2. GPU Gaussian blur for background (no pixelation)
   const src = new OffscreenCanvas(width, height);
   src.getContext("2d")!.putImageData(
-    new ImageData(new Uint8ClampedArray(pixels), width, height),
-    0, 0
+    new ImageData(new Uint8ClampedArray(pixels), width, height), 0, 0
   );
-
   const blurred = new OffscreenCanvas(width, height);
-  const bCtx = blurred.getContext("2d")!;
-  bCtx.filter = `blur(${Math.round(strength)}px)`;
+  const bCtx    = blurred.getContext("2d")!;
+  bCtx.filter   = `blur(${blurStrength}px)`;
   bCtx.drawImage(src, 0, 0);
-
   const blurData = bCtx.getImageData(0, 0, width, height).data;
-  onProgress?.(80);
+  onProgress?.(65);
 
-  // 3. Composite: sharp × mask  +  blurred × (1 − mask)
+  // 3. Composite: subject (boosted+warm) × mask  +  background (darkened+blurred) × (1−mask)
   const result = new Uint8ClampedArray(pixels.length);
+
   for (let i = 0; i < width * height; i++) {
-    const m   = feathered[i];     // 1 = keep sharp, 0 = use blur
+    const m   = mask[i];
     const inv = 1 - m;
-    result[i * 4]     = Math.round(pixels[i * 4]     * m + blurData[i * 4]     * inv);
-    result[i * 4 + 1] = Math.round(pixels[i * 4 + 1] * m + blurData[i * 4 + 1] * inv);
-    result[i * 4 + 2] = Math.round(pixels[i * 4 + 2] * m + blurData[i * 4 + 2] * inv);
+
+    // Subject layer — boost brightness, add subtle flash warmth on highlights
+    const lum = (pixels[i * 4] * 0.2126 + pixels[i * 4 + 1] * 0.7152 + pixels[i * 4 + 2] * 0.0722) / 255;
+    const flashWarm = lum * lum * 0.07;   // warm only the brighter areas (quadratic)
+
+    const sR = Math.min(255, pixels[i * 4]     * subjectBoost + flashWarm * 255 * 0.55);
+    const sG = Math.min(255, pixels[i * 4 + 1] * subjectBoost + flashWarm * 255 * 0.20);
+    const sB = Math.max(0,   pixels[i * 4 + 2] * subjectBoost - flashWarm * 255 * 0.25);
+
+    // Background layer — darkened and blurred
+    const bR = blurData[i * 4]     * bgDarken;
+    const bG = blurData[i * 4 + 1] * bgDarken;
+    const bB = blurData[i * 4 + 2] * bgDarken;
+
+    result[i * 4]     = Math.min(255, Math.max(0, Math.round(sR * m + bR * inv)));
+    result[i * 4 + 1] = Math.min(255, Math.max(0, Math.round(sG * m + bG * inv)));
+    result[i * 4 + 2] = Math.min(255, Math.max(0, Math.round(sB * m + bB * inv)));
     result[i * 4 + 3] = pixels[i * 4 + 3];
   }
-  onProgress?.(100);
 
+  onProgress?.(100);
   return result;
 }
 
 // ---------------------------------------------------------------------------
-// Mask feathering — smooth the hard segmentation edge at 40% resolution
+// Mask feathering — smooth the segmentation edge at 40% resolution
 // ---------------------------------------------------------------------------
 
 function featherMask(mask: Float32Array, w: number, h: number): Float32Array {
-  const SCALE  = 0.40;   // higher than before → less blockiness
-  const sw = Math.max(1, Math.round(w * SCALE));
-  const sh = Math.max(1, Math.round(h * SCALE));
+  const SCALE = 0.40;
+  const sw    = Math.max(1, Math.round(w * SCALE));
+  const sh    = Math.max(1, Math.round(h * SCALE));
 
-  // Downscale
   const small = new Float32Array(sw * sh);
   for (let y = 0; y < sh; y++) {
     for (let x = 0; x < sw; x++) {
@@ -77,12 +95,10 @@ function featherMask(mask: Float32Array, w: number, h: number): Float32Array {
     }
   }
 
-  // Two-pass separable box blur
   const RADIUS = 8;
   const tmp     = boxBlur1D(small, sw, sh, RADIUS, true);
   const blurred = boxBlur1D(tmp,   sw, sh, RADIUS, false);
 
-  // Upscale back to full resolution
   const result = new Float32Array(w * h);
   for (let y = 0; y < h; y++) {
     for (let x = 0; x < w; x++) {
@@ -96,8 +112,7 @@ function featherMask(mask: Float32Array, w: number, h: number): Float32Array {
 
 function boxBlur1D(
   src: Float32Array,
-  w: number,
-  h: number,
+  w: number, h: number,
   radius: number,
   horizontal: boolean
 ): Float32Array {
@@ -111,7 +126,7 @@ function boxBlur1D(
         sum += src[y * w + Math.max(0, Math.min(w - 1, x))];
       for (let x = 0; x < w; x++) {
         sum += src[y * w + Math.min(w - 1, x + radius)];
-        sum -= src[y * w + Math.max(0,     x - radius - 1)];
+        sum -= src[y * w + Math.max(0, x - radius - 1)];
         dst[y * w + x] = sum / span;
       }
     }
@@ -122,7 +137,7 @@ function boxBlur1D(
         sum += src[Math.max(0, Math.min(h - 1, y)) * w + x];
       for (let y = 0; y < h; y++) {
         sum += src[Math.min(h - 1, y + radius) * w + x];
-        sum -= src[Math.max(0,     y - radius - 1) * w + x];
+        sum -= src[Math.max(0, y - radius - 1) * w + x];
         dst[y * w + x] = sum / span;
       }
     }

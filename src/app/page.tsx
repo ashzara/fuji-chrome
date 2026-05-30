@@ -7,10 +7,9 @@ import { fetchDeployedLUT, fileToImageData, imageDataToBlob } from "@/lib/imageU
 import { normalizeExposure } from "@/lib/normalize";
 import { applyLUT, LUT_SIZE } from "@/lib/lut";
 import { measureLabStats, buildAdaptiveFilmLUT } from "@/lib/colorTransfer";
+import { initSegmenter, segmentImage } from "@/lib/segment";
+import { applySubjectFlash } from "@/lib/bokeh";
 import { applyVignette, applyHalation, applyGrain } from "@/lib/filmEffects";
-
-// If a trained lut.json exists in /public it overrides the adaptive LUT.
-// Otherwise every photo gets its own adaptive LUT built from its colours.
 
 type ProcessingState = "idle" | "processing" | "done" | "error";
 
@@ -28,85 +27,88 @@ export default function Home() {
   const [progress, setProgress]           = useState(0);
   const [progressLabel, setProgressLabel] = useState("");
   const [errorMsg, setErrorMsg]           = useState("");
+  const [modelReady, setModelReady]       = useState(false);
   const [activeModal, setActiveModal]     = useState<PhotoResult | null>(null);
 
-  // Trained LUT from /public/lut.json (optional override)
   const trainedLUTRef = useRef<Float32Array | null>(null);
-  const lutLoadedRef  = useRef(false);
 
   useEffect(() => {
-    fetchDeployedLUT().then((lut) => {
-      trainedLUTRef.current = lut;   // null if not found — adaptive LUT used instead
-      lutLoadedRef.current  = true;
-    });
+    fetchDeployedLUT().then((lut) => { trainedLUTRef.current = lut; });
+    initSegmenter().then(() => setModelReady(true));
   }, []);
 
-  // ── Full film pipeline ───────────────────────────────────────────────────
+  // ── Film pipeline ─────────────────────────────────────────────────────────
   const processFile = async (file: File): Promise<PhotoResult> => {
     const beforeUrl = URL.createObjectURL(file);
     const name = file.name.replace(/\.[^.]+$/, "");
 
     // 1. Load (EXIF-aware)
     setProgressLabel("Loading…");
-    setProgress(8);
+    setProgress(5);
     const imageData = await fileToImageData(file);
     const pixels    = new Uint8ClampedArray(imageData.data);
 
-    // 2. Gentle exposure correction only — colours completely untouched
+    // 2. Segment subject from background
+    setProgressLabel("Detecting subject…");
+    setProgress(12);
+    const mask = await segmentImage(imageData);
+
+    // 3. Gentle exposure correction only
     setProgressLabel("Balancing exposure…");
-    setProgress(15);
+    setProgress(20);
     normalizeExposure(pixels);
 
-    // 3. Build or fetch the film LUT
-    setProgressLabel("Matching film colours…");
-    setProgress(25);
-
-    let filmLUT: Float32Array;
-    if (trainedLUTRef.current) {
-      // Admin has uploaded a trained LUT — use it directly
-      filmLUT = trainedLUTRef.current;
-    } else {
-      // No trained LUT — measure this photo's colours and build an adaptive LUT
-      // that automatically shifts them toward the reference film look
-      const stats = measureLabStats(pixels);
-      filmLUT = buildAdaptiveFilmLUT(stats);
-    }
-
-    // 4. Apply film LUT (colour grade + Classic Chrome look)
-    setProgressLabel("Applying film look…");
-    setProgress(35);
-    const lutResult = await applyLUT(
+    // 4. Subject flash effect:
+    //    • Background → darkened to ~35% + subtle blur (recedes into dark)
+    //    • Subject    → brightness boost + warm flash tint (pops forward)
+    setProgressLabel("Separating subject…");
+    setProgress(28);
+    const flashPixels = await applySubjectFlash(
       pixels,
-      filmLUT,
-      LUT_SIZE,
-      (p) => setProgress(35 + p * 0.45)   // 35 → 80
+      imageData.width,
+      imageData.height,
+      mask,
+      { blurStrength: 10, bgDarken: 0.35, subjectBoost: 1.10 },
+      (p) => setProgress(28 + p * 0.22)   // 28 → 50
     );
 
-    // 5. Film finishing effects
-    setProgressLabel("Adding film character…");
-    setProgress(82);
-    const finalPixels = new Uint8ClampedArray(lutResult);
-    applyHalation(finalPixels, imageData.width, imageData.height);  // warm glow on highlights
-    applyVignette(finalPixels, imageData.width, imageData.height);  // subtle dark corners
-    applyGrain(finalPixels, imageData.width, imageData.height);     // film grain
+    // 5. Build adaptive film LUT (colour-matches this photo to reference film look)
+    setProgressLabel("Matching film colours…");
+    setProgress(52);
+    const filmLUT = trainedLUTRef.current ?? buildAdaptiveFilmLUT(measureLabStats(flashPixels));
 
-    // 6. Encode to JPEG
-    setProgress(96);
-    const blob    = await imageDataToBlob(new ImageData(finalPixels, imageData.width, imageData.height));
+    // 6. Apply film colour grade
+    setProgressLabel("Applying film look…");
+    setProgress(56);
+    const lutResult = await applyLUT(
+      flashPixels,
+      filmLUT,
+      LUT_SIZE,
+      (p) => setProgress(56 + p * 0.28)   // 56 → 84
+    );
+
+    // 7. Film finishing: glow → vignette → grain
+    setProgressLabel("Adding film character…");
+    setProgress(86);
+    const finalPixels = new Uint8ClampedArray(lutResult);
+    applyHalation(finalPixels, imageData.width, imageData.height);
+    applyVignette(finalPixels, imageData.width, imageData.height);
+    applyGrain(finalPixels, imageData.width, imageData.height);
+
+    // 8. Encode to JPEG
+    setProgress(97);
+    const blob     = await imageDataToBlob(new ImageData(finalPixels, imageData.width, imageData.height));
     const afterUrl = URL.createObjectURL(blob);
     return { id: crypto.randomUUID(), name, beforeUrl, afterUrl, afterBlob: blob };
   };
 
-  // ── File handler ─────────────────────────────────────────────────────────
+  // ── Handlers ──────────────────────────────────────────────────────────────
   const handleFiles = useCallback(
     async (files: File[]) => {
       if (files.length === 0) return;
       results.forEach((r) => { URL.revokeObjectURL(r.beforeUrl); URL.revokeObjectURL(r.afterUrl); });
-      setResults([]);
-      setActiveModal(null);
-      setAppState("processing");
-      setErrorMsg("");
-      setProgress(0);
+      setResults([]); setActiveModal(null);
+      setAppState("processing"); setErrorMsg(""); setProgress(0);
 
       try {
         const newResults: PhotoResult[] = [];
@@ -148,8 +150,10 @@ export default function Home() {
 
       <header className="text-center">
         <h1 className="text-2xl font-semibold tracking-wide text-[#e8e8e8]">Fuji Chrome</h1>
-        <p className="text-[#666] text-xs mt-1 tracking-widest uppercase">
-          Classic Chrome · Film Look
+        <p className="text-[#666] text-xs mt-1 tracking-widest uppercase">Classic Chrome · Film Look</p>
+        <p className={["text-[10px] mt-2 tracking-wider uppercase transition-colors duration-500",
+          modelReady ? "text-[#4a7c5a]" : "text-[#444]"].join(" ")}>
+          {modelReady ? "● Model ready" : "○ Loading model…"}
         </p>
       </header>
 
@@ -201,10 +205,8 @@ export default function Home() {
                 </div>
                 <div className="px-3 py-2.5 flex items-center justify-between">
                   <p className="text-xs text-[#666] truncate">{r.name}</p>
-                  <button
-                    onClick={(e) => { e.stopPropagation(); const a = document.createElement("a"); a.href = URL.createObjectURL(r.afterBlob); a.download = `${r.name}_fuji.jpg`; a.click(); }}
-                    className="text-[#c8a882] hover:text-[#d4b896] transition-colors shrink-0 ml-2" title="Download"
-                  >
+                  <button onClick={(e) => { e.stopPropagation(); const a = document.createElement("a"); a.href = URL.createObjectURL(r.afterBlob); a.download = `${r.name}_fuji.jpg`; a.click(); }}
+                    className="text-[#c8a882] hover:text-[#d4b896] transition-colors shrink-0 ml-2" title="Download">
                     <DownloadIcon />
                   </button>
                 </div>
@@ -220,10 +222,8 @@ export default function Home() {
             <BeforeAfterSlider beforeUrl={activeModal.beforeUrl} afterUrl={activeModal.afterUrl} />
             <div className="flex items-center justify-between mt-3">
               <button onClick={() => setActiveModal(null)} className="text-[#666] text-sm hover:text-[#999] transition-colors">✕ Close</button>
-              <button
-                onClick={() => { const a = document.createElement("a"); a.href = URL.createObjectURL(activeModal.afterBlob); a.download = `${activeModal.name}_fuji.jpg`; a.click(); }}
-                className="flex items-center gap-2 bg-[#c8a882] hover:bg-[#d4b896] text-black font-medium text-sm px-5 py-2.5 rounded-lg transition-colors"
-              >
+              <button onClick={() => { const a = document.createElement("a"); a.href = URL.createObjectURL(activeModal.afterBlob); a.download = `${activeModal.name}_fuji.jpg`; a.click(); }}
+                className="flex items-center gap-2 bg-[#c8a882] hover:bg-[#d4b896] text-black font-medium text-sm px-5 py-2.5 rounded-lg transition-colors">
                 <DownloadIcon /> Download
               </button>
             </div>
